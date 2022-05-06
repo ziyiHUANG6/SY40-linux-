@@ -1,0 +1,636 @@
+#include <stdio.h>
+#include <semaphore.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <time.h>
+#include <assert.h>
+#include <unistd.h>
+
+/**
+ * enum， Marquer le type de véhicule
+ */
+enum vehicle_type{
+    TRUCK, TRAIN, SHIP
+};
+
+
+#define SHIP_LOAD 2 //Nombre de caisses de fret sur le navire
+#define TRAIN_LOAD 10 //Le nombre de caisses dans le train = le nombre de voitures * 2
+#define TRUCK_LOAD 1 //Nombre de cartons dans le camion
+
+#define MAX_TRAIN_POSITIONS 2 //Nombre maximum de trains pouvant s'arrêter en même temps
+#define MAX_TRUCK_POSITIONS 6 //Nombre maximum de camions pouvant être garés en même temps
+#define MAX_SHIP_POSITIONS 2  //Nombre maximum de navires pouvant accoster en même temps
+#define INIT_SHIPS  0 //Nombre de navires commençant à accoster
+#define INIT_VEHICLES 0 //Nombre de véhicules commençant à s'arrêter (train + camion)
+
+#define NUM_PORTIQUES  2  //Le nombre de filetages de la grue
+#define NUM_SHIPS  5  //Le nombre de filetages du navire
+#define NUM_TRAINS  5 //Le nombre de filetages du train
+#define NUM_TRUCKS  12  //Le nombre de filetages pour le camion
+
+#define MAX_NAME  31 //Nombre maximal de caractères dans le nom d’un véhicule
+#define MAX_SLEEP 3 //Limite supérieure du nombre de secondes pendant lesquelles un filetage dort
+#define MAX_CITY 2  //Le nombre maximum de villes
+
+struct vehicle_struct{
+    int id; //Chaque outil est unique et dispose également d’un index dans la gamme de véhicules
+    int target_city_index;  //Index de la ville
+    int loads;  //Le nombre de boîtes de marchandises chargées
+    int used_by; //L’ID de la grue sélectionnée, par exemple 0, est sélectionné par le numéro de grue 0
+    enum vehicle_type type; //Types de véhicules Bateaux Trains Camions, etc.
+    sem_t to_leave_lock; //La quantité de signal utilisée pour indiquer si le véhicule peut partir
+    char name  [MAX_NAME + 1]; //nom
+};
+
+struct portique_struct{
+    char name  [MAX_NAME];
+    int id; //Le numéro de la grue
+    int loading_from; //L’index du navire
+    int loading_to; // Un index des camions ou des trains
+    int target_city_index; //Index de la ville cible des marchandises transportées
+};
+
+typedef struct vehicle_struct vehicle;
+typedef vehicle * vehicle_ptr;
+typedef struct portique_struct * portique_ptr;
+
+vehicle_ptr  make_vehicle(enum vehicle_type type, int id);
+void* portique_thread(void* args);
+void* ship_thread(void* args);
+void* train_thread(void* args);
+void* truck_thread(void* args);
+void ship_enter(int id);
+void ship_leave(int id);
+void train_enter(int id);
+void train_leave(int id);
+void truck_enter(int id);
+void truck_leave(int id);
+int isFull(int id);
+void selectLoadToVehicle(struct portique_struct* portique_star);
+
+pthread_t* ships; //Un tableau de filetages pour le navire
+pthread_t* trains;//Un tableau de filetages pour le train
+pthread_t* trucks;//Un tableau de filetages pour la camion
+pthread_t* portiques;//Un tableau de filetages pour la protique
+
+vehicle_ptr vehicle_data[NUM_SHIPS + NUM_TRAINS + NUM_TRUCKS]; //Un tableau de véhicules, avec un élément correspondant à un véhicule
+portique_ptr portique_data[NUM_PORTIQUES]; //Tableau de données de grues Un élément correspond à une portique
+
+vehicle_ptr vehicle_queue[NUM_TRAINS + NUM_TRUCKS]; //Données pouvant être utilisées pour décharger les véhicules déjà amarrés au port, y compris les camions et les trains，
+vehicle_ptr ship_data[MAX_SHIP_POSITIONS]; //Données sur les navires qui ont accosté au port
+int num_vehicles = 0; //Le nombre total de camions et de trains dans le port
+int num_ships = 0; //Le nombre de navires amarrés au port
+char* cities[] = {"paris", "lyon"}; //Un tableau de noms de villes, le nombre de villes doit être égal au MAX_CITY défini précédemment
+
+void init();
+
+
+/*
+ * Le nombre de navires qui ont accosté au port
+ */
+sem_t sem_ships;
+/*
+ * Le nombre de navires qui peuvent continuer à faire escale à un certain moment dans le port
+ */
+sem_t sem_ship_positions;
+/*
+ * Le nombre de trains et de camions disponibles à la fois
+ */
+sem_t sem_vehicles;
+/*
+ * Le nombre de trains qui peuvent continuer à arriver à un certain moment
+ */
+sem_t sem_train_positions;
+/*
+ * Le nombre de camions qui peuvent continuer à rouler à un certain moment
+ */
+sem_t sem_truck_positions;
+
+/**
+ * L'écluse du navire qui est entré dans le port
+ */
+sem_t ship_lock;
+
+/**
+ * Serrures pour les files d'attente de tous les véhicules déchargés (y compris les trains et les camions)
+ */
+sem_t vehicle_lock;
+
+
+
+int main(int argc, char** argv) {
+    srand(time(0));
+    init();
+    int i, vehicle_id = 0;
+    /**
+     * Créer un filetage de bateau
+     */
+    for(i = 0; i < NUM_SHIPS; ++i){
+        pthread_create(ships + i, NULL, ship_thread, vehicle_data[vehicle_id]);
+        ++vehicle_id;
+    }
+
+    /**
+   * Créer un filetage de train
+   */
+    for(i = 0; i < NUM_TRAINS; ++i){
+        pthread_create(trains + i, NULL, train_thread, vehicle_data[vehicle_id]);
+        ++vehicle_id;
+    }
+
+    /**
+   * Créer un filetage de camion
+   */
+    for(i = 0; i < NUM_TRUCKS; ++i){
+        pthread_create(trucks + i, NULL, truck_thread, vehicle_data[vehicle_id]);
+        ++vehicle_id;
+    }
+
+
+    /**
+   * Créer un filetage de portique
+   */
+    for(i = 0; i < NUM_PORTIQUES; ++i){
+        pthread_create(portiques + i, NULL, portique_thread, portique_data[i]);
+    }
+
+    for(i = 0; i < NUM_SHIPS; ++i){
+        pthread_join(*(ships+i), NULL);
+    }
+
+    for(i = 0; i < NUM_TRAINS; ++i){
+        pthread_join(*(trains+i), NULL);
+    }
+
+    for(i = 0; i < NUM_TRUCKS; ++i){
+        pthread_join(*(trucks+i), NULL);
+    }
+
+    for(i = 0; i < NUM_PORTIQUES; ++i){
+        pthread_join(*(portiques+i), NULL);
+    }
+
+
+    return 0;
+}
+
+/**
+ * Initialisez les données pour les navires, les trains, les camions et les portiques. Initialiser plusieurs sémaphores en même temps.
+ */
+void init(){
+    int vehicle_id, ship_id, train_id, truck_id, portique_id;
+    //  int num_vehicle  = NUM_TRUCKS + NUM_TRAINS + NUM_SHIPS;
+    vehicle_id = 0;
+
+    /**
+    * Créer des données de navire
+    */
+    for(ship_id = 0; ship_id < NUM_SHIPS; ++ship_id){
+        vehicle_data[vehicle_id] = make_vehicle(SHIP, vehicle_id);
+        vehicle_data[vehicle_id]->name[0] = '\0';
+        sprintf(vehicle_data[vehicle_id]->name, "Ship_%d", ship_id);
+        vehicle_data[vehicle_id]->loads = SHIP_LOAD;
+        vehicle_data[vehicle_id]->target_city_index = rand() % MAX_CITY;
+        ++vehicle_id;
+    }
+
+    /**
+    * Créer des données de train
+    */
+    for(train_id = 0; train_id < NUM_TRAINS; ++train_id){
+        vehicle_data[vehicle_id] = make_vehicle(TRAIN, vehicle_id);
+        vehicle_data[vehicle_id]->name[0] = '\0';
+        sprintf(vehicle_data[vehicle_id]->name, "Train_%d", train_id);
+        vehicle_data[vehicle_id]->loads = TRAIN_LOAD;
+        vehicle_data[vehicle_id]->target_city_index = rand() % MAX_CITY;
+        ++vehicle_id;
+    }
+
+    /**
+    * Créer des données de camion
+    */
+    for(truck_id = 0; truck_id < NUM_TRUCKS; ++truck_id){
+        vehicle_data[vehicle_id] = make_vehicle(TRUCK, vehicle_id);
+        vehicle_data[vehicle_id]->name[0] = '\0';
+        sprintf(vehicle_data[vehicle_id]->name, "Truck_%d", truck_id);
+        vehicle_data[vehicle_id]->loads = TRUCK_LOAD;
+        vehicle_data[vehicle_id]->target_city_index = rand() % MAX_CITY;
+        ++vehicle_id;
+    }
+
+    /**
+    * Créer des données de portique
+    */
+    for(portique_id = 0; portique_id < NUM_PORTIQUES; ++portique_id){
+        portique_data[portique_id] = (portique_ptr)malloc(sizeof(struct portique_struct));
+        portique_data[portique_id]->name[0] = '\0';
+        sprintf(portique_data[portique_id]->name, "Portique_%d", portique_id);
+        portique_data[portique_id]->id = portique_id;
+        portique_data[portique_id]->loading_from = -1;
+        portique_data[portique_id]->loading_to = -1;
+    }
+
+    /**
+     * Allouer de la mémoire pour les pointeurs de thread des navires, des trains, des trains et des portiques
+     */
+    ships = (pthread_t*)malloc(sizeof(pthread_t) * NUM_SHIPS);
+    trains = (pthread_t*)malloc(sizeof(pthread_t) * NUM_TRAINS);
+    trucks = (pthread_t*)malloc(sizeof(pthread_t) * NUM_TRUCKS);
+    portiques = (pthread_t*)malloc(sizeof(pthread_t) * NUM_PORTIQUES);
+
+    /**
+     * Initialiser le sémaphore
+     */
+    sem_init(&sem_ship_positions, 0, MAX_SHIP_POSITIONS);
+    sem_init(&sem_ships, 0, INIT_SHIPS);
+    sem_init(&sem_train_positions, 0, MAX_TRAIN_POSITIONS);
+    sem_init(&sem_truck_positions, 0, MAX_TRUCK_POSITIONS);
+    sem_init(&sem_vehicles, 0, INIT_VEHICLES);
+
+    sem_init(&ship_lock, 0, 1);
+    sem_init(&vehicle_lock, 0, 1);
+}
+
+
+/**
+ * Allouez de la mémoire pour les navires, les trains, les camions, etc.
+ * @param type
+ * @param id
+ * @return
+ */
+vehicle_ptr  make_vehicle(enum vehicle_type type, int id){
+    vehicle_ptr  ptr_vehicle = (vehicle_ptr)malloc(sizeof(vehicle));
+    ptr_vehicle->type = type;
+    ptr_vehicle->id = id;
+    /**
+     * Attribuez aléatoirement une ville de destination au véhicule
+     */
+    ptr_vehicle->target_city_index = rand() % MAX_CITY;
+    ptr_vehicle->used_by = -1;
+    if(type == SHIP){
+        ptr_vehicle->loads = SHIP_LOAD;
+    }
+    else if(type == TRAIN){
+        ptr_vehicle->loads = 0;
+    }
+    else if(type == TRUCK){
+        ptr_vehicle->loads = 0;
+    }
+//  sem_init(&ptr_vehicle->vehicle_lock, 0, 1);
+    sem_init(&ptr_vehicle->to_leave_lock, 0, 0);
+    return ptr_vehicle;
+}
+
+/**
+ * Fil de portique
+ * @param args
+ * @return
+ */
+void* portique_thread(void* args){
+    portique_ptr  portique_star = (portique_ptr)args;
+
+    while(1){
+        printf("%s Prêt à décharger\n", portique_star->name);
+        /**
+         * S'il n'y a pas de navire que la portique  décharge
+         */
+        if(portique_star->loading_from == -1){
+            /**
+             * En attendant le navire
+             */
+            sem_wait(&sem_ships);
+            int ship_index;
+            int flag = 0;
+            /**
+             * Trouver un navire qui ne décharge pas
+             */
+            sem_wait(&ship_lock);
+            for(ship_index = 0; !flag && ship_index < num_ships; ++ship_index){
+                if(ship_data[ship_index]->used_by == -1){
+                    ship_data[ship_index]->used_by = portique_star->id;
+                    portique_star->loading_from = ship_data[ship_index]->id;
+                    flag = 1;
+                }
+            }
+            sem_post(&ship_lock);
+            /**
+             * S'assurer que la portique a été affectée au navire de déchargement
+             */
+            assert( portique_star->loading_from != -1);
+        }
+        /**
+         * Décharger une boîte de cargaison du navire
+         */
+        --vehicle_data[portique_star->loading_from]->loads;
+        /**
+         * Rappelez-vous la destination de la cargaison déchargée par la portique
+         */
+        portique_star->target_city_index = vehicle_data[portique_star->loading_from]->target_city_index;
+        printf("%s de %s destination-> %s Décharger une boîte de fret\n", portique_star->name, vehicle_data[portique_star->loading_from]->name,
+               cities[ vehicle_data[portique_star->loading_from]->target_city_index]);
+        printf("%s destination -> %s capacité de %d %d cases restantes\n", vehicle_data[portique_star->loading_from]->name,
+               cities[ vehicle_data[portique_star->loading_from]->target_city_index],
+               SHIP_LOAD,
+               vehicle_data[portique_star->loading_from]->loads);
+        /**
+         * Vérifiez si le navire a déchargé toute la cargaison
+         */
+        if(vehicle_data[portique_star->loading_from]->loads == 0){
+            /**
+             * Supprimer le navire de la liste des candidats
+             */
+            ship_leave(portique_star->loading_from);
+            /**
+             * Rappelez au navire qu'il peut partir
+             */
+            sem_post(&vehicle_data[portique_star->loading_from]->to_leave_lock);
+            /**
+             * Ne peut plus décharger du navire
+             */
+            portique_star->loading_from = -1;
+        }
+
+        /**
+         * Si la portique n'a pas sélectionné le véhicule de déchargement ou si la destination du véhicule de déchargement précédemment sélectionné est incompatible avec la destination de la cargaison actuelle
+         * À ce stade, vous devez re-sélectionner le véhicule qui correspond à la destination de la cargaison
+         */
+        if(portique_star->loading_to == -1 || portique_star->target_city_index !=
+                                              vehicle_data[portique_star->loading_to]->target_city_index){
+            selectLoadToVehicle(portique_star);
+            assert( portique_star->loading_to != -1);
+        }
+        /**
+         * Charger une boîte de fret pour le train ou le camion
+         */
+        ++vehicle_data[portique_star->loading_to]->loads;
+        int load = vehicle_data[portique_star->loading_to]->type == TRAIN ? TRAIN_LOAD : TRUCK_LOAD;
+        printf("%s Chargé une boîte de marchandises à %s destination-> %s\n", portique_star->name, vehicle_data[portique_star->loading_to]->name,
+               cities[vehicle_data[portique_star->loading_to]->target_city_index]);
+        printf("%s destination-> %s capacité de %d Peut encore chargé %d boîte de fret\n", vehicle_data[portique_star->loading_to]->name,
+               cities[vehicle_data[portique_star->loading_to]->target_city_index],
+               load,
+               load - vehicle_data[portique_star->loading_to]->loads);
+        if(isFull(portique_star->loading_to)){
+//      printf("full already\n");
+            /**
+             * Avertissez que le train ou le camion peut partir.
+             */
+            if(vehicle_data[portique_star->loading_to]->type == TRAIN){
+                train_leave(portique_star->loading_to);
+            }
+            else{
+                truck_leave(portique_star->loading_to);
+            }
+            sem_post(&vehicle_data[portique_star->loading_to]->to_leave_lock);
+            /**
+             * Le véhicule ne peut plus être chargé
+             */
+            portique_star->loading_to = -1;
+        }
+    }
+}
+
+
+/**
+ * Filetage du navire
+ * @param args
+ * @return
+ */
+void* ship_thread(void* args){
+    vehicle_ptr  vehicle_star = (vehicle_ptr)args;
+
+    while(1){
+        vehicle_star->loads = SHIP_LOAD;
+        vehicle_star->used_by = -1;
+        vehicle_star->target_city_index = rand() % MAX_CITY;
+        printf("%s destination-> %s Arrivé au port, fait la queue pour trouver une place！\n", vehicle_star->name, cities[vehicle_star->target_city_index]);
+        sem_wait(&sem_ship_positions);
+        ship_enter(vehicle_star->id);
+        sem_post(&sem_ships);
+        sem_wait(&vehicle_star->to_leave_lock);
+        sem_post(&sem_ship_positions);
+        sleep(rand() % MAX_SLEEP);
+    }
+}
+
+
+/**
+ * Filetage du train
+ * @param args
+ * @return
+ */
+void* train_thread(void* args){
+    vehicle_ptr  vehicle_star = (vehicle_ptr)args;
+
+    while(1){
+        vehicle_star->loads = 0;
+        vehicle_star->used_by = -1;
+        vehicle_star->target_city_index = rand() % MAX_CITY;
+        printf("%s destination-> %s Arrivé au port, fait la queue pour trouver une place！\n", vehicle_star->name, cities[vehicle_star->target_city_index]);
+        sem_wait(&sem_train_positions);
+        train_enter(vehicle_star->id);
+        sem_post(&sem_vehicles);
+        sem_wait(&vehicle_star->to_leave_lock);
+        sem_post(&sem_train_positions);
+        sleep(rand() % MAX_SLEEP);
+    }
+}
+
+
+/**
+ * Filetage du camion
+ * @param args
+ * @return
+ */
+void* truck_thread(void* args){
+    vehicle_ptr  vehicle_star = (vehicle_ptr)args;
+
+    while(1){
+        vehicle_star->loads = 0;
+        vehicle_star->used_by = -1;
+        vehicle_star->target_city_index = rand() % MAX_CITY;
+        printf("%s  destination-> %s Arrivé au port, fait la queue pour trouver une place！\n", vehicle_star->name, cities[vehicle_star->target_city_index]);
+        sem_wait(&sem_truck_positions);
+        truck_enter(vehicle_star->id);
+        sem_post(&sem_vehicles);
+        sem_wait(&vehicle_star->to_leave_lock);
+        sem_post(&sem_truck_positions);
+        sleep(rand() % MAX_SLEEP);
+    }
+}
+
+
+
+
+/**
+ * Navire entrant dans le port
+ * @param id
+ */
+void ship_enter(int id){
+    sem_wait(&ship_lock);
+    ship_data[num_ships++] = vehicle_data[id];
+    printf("%s destination-> %s Trouvez l'emplacement, en attendant de décharger la cargaison！\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&ship_lock);
+}
+
+
+/**
+ * Navire hors du port
+ * @param id
+ */
+void ship_leave(int id){
+    sem_wait(&ship_lock);
+    int ship_index, index;
+    int flag = 0;
+    for(ship_index = 0; !flag && ship_index < num_ships; ++ship_index){
+        if(ship_data[ship_index]->id == id){
+            index = ship_index;
+            flag = 1;
+        }
+    }
+    for(ship_index = index; ship_index < num_ships - 1; ++ship_index){
+        ship_data[ship_index] = ship_data[ship_index + 1];
+    }
+    --num_ships;
+    printf("%s destination-> %s Après avoir déchargé toutes les marchandises, le port a été ouvert!\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&ship_lock);
+}
+
+
+/**
+ * train entrant dans le port
+ * @param id
+ */
+void train_enter(int id){
+    sem_wait(&vehicle_lock);
+//  vehicle_data[num_vehicles++] = vehicle_data[id];
+    vehicle_queue[num_vehicles++] = vehicle_data[id];
+    printf("%s destination-> %s Après avoir déchargé toutes les marchandises, le port a été ouver！\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&vehicle_lock);
+}
+
+/**
+ * train hors du port
+ * @param id
+ */
+void train_leave(int id){
+    sem_wait(&vehicle_lock);
+    int vehicle_index, index;
+    int flag = 0;
+    for(vehicle_index = 0; !flag && vehicle_index < num_vehicles; ++vehicle_index){
+        if(vehicle_queue[vehicle_index]->id == id){
+            index = vehicle_index;
+            flag = 1;
+        }
+    }
+    for(vehicle_index = index; vehicle_index < num_vehicles - 1; ++vehicle_index){
+        vehicle_queue[vehicle_index] = vehicle_queue[vehicle_index + 1];
+    }
+    --num_vehicles;
+    printf("%s destination-> %s C'est plein donc il quitte le port!\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&vehicle_lock);
+}
+
+
+/**
+ * camion entrant dans le port
+ */
+void truck_enter(int id){
+    sem_wait(&vehicle_lock);
+//  vehicle_data[num_vehicles++] = vehicle_data[id];
+    vehicle_queue[num_vehicles++] = vehicle_data[id];
+    printf("%s destination-> %s Trouvez l'emplacement, en attendant de décharger la cargaison！\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&vehicle_lock);
+}
+
+
+/**
+ * camion hors du port
+ * @param id
+ */
+void truck_leave(int id){
+    sem_wait(&vehicle_lock);
+    int vehicle_index, index;
+    int flag = 0;
+    for(vehicle_index = 0; !flag && vehicle_index < num_vehicles; ++vehicle_index){
+        if(vehicle_queue[vehicle_index]->id == id){
+            index = vehicle_index;
+            flag = 1;
+        }
+    }
+    for(vehicle_index = index; vehicle_index < num_vehicles - 1; ++vehicle_index){
+        vehicle_queue[vehicle_index] = vehicle_queue[vehicle_index + 1];
+    }
+    --num_vehicles;
+    printf("%s destination-> %s C'est plein donc il quitte le port!\n", vehicle_data[id]->name, cities[vehicle_data[id]->target_city_index]);
+    sem_post(&vehicle_lock);
+}
+
+
+/**
+ * Déterminez si le camion ou le train est plein
+ */
+int isFull(int id){
+    return vehicle_data[id]->type == TRAIN && vehicle_data[id]->loads == TRAIN_LOAD ||
+           vehicle_data[id]->type == TRUCK && vehicle_data[id]->loads == TRUCK_LOAD;
+}
+
+/**
+ * Choisissez un véhicule avec la même destination pour chaque carton de marchandise
+ * @param portique_star
+ */
+void selectLoadToVehicle(struct portique_struct* portique_star){
+    int flag  = 0, vehicle_index;
+    while(1){
+        sem_wait(&sem_vehicles);
+        sem_wait(&vehicle_lock);
+        for(vehicle_index = 0; !flag && vehicle_index < num_vehicles; ++vehicle_index){
+            if(vehicle_queue[vehicle_index]->used_by == -1 && vehicle_queue[vehicle_index]->target_city_index
+                                                              == portique_star->target_city_index){
+                flag = 1;
+                portique_star->loading_to = vehicle_queue[vehicle_index]->id;
+                vehicle_queue[vehicle_index]->used_by = portique_star->id;
+            }
+        }
+        if(flag){
+            sem_post(&vehicle_lock);
+            return;
+        }
+            /**
+             * Si la destination de tous les véhicules et la destination de la cargaison sont incohérentes, nous laisserons le dernier camion de la file d'attente se retirer de la file d'attente.
+             */
+        else{
+            printf("Pas de vehicule de destination de: %s ，On va forcer le retour d'un camion.\n", cities[portique_star->target_city_index]);
+            int id, index, vehicle_index;
+            /**
+             * Trouver l'indice du camion pour sortir de la file d'attente
+             */
+            for(vehicle_index = num_vehicles - 1; vehicle_index >= 0; --vehicle_index){
+                if(vehicle_queue[vehicle_index]->type == TRUCK && vehicle_queue[vehicle_index]->used_by == -1){
+                    id =vehicle_queue[vehicle_index]->id;
+                    index = vehicle_index;
+                    break;
+                }
+            }
+            /**
+             * Avertir le fil de discussion du camion de quitter
+             */
+            sem_post(&vehicle_queue[vehicle_index]->to_leave_lock);
+            printf("%s destination-> %s Forcé de quitter en raison d'une incohérence avec la destination du fret-> %s \n", vehicle_queue[vehicle_index]->name,
+                   cities[vehicle_queue[vehicle_index]->target_city_index], cities[portique_star->target_city_index]);
+            /**
+             * Réduire la file d'attente
+             */
+            for(vehicle_index = index; vehicle_index < num_vehicles - 1; ++vehicle_index){
+                vehicle_queue[vehicle_index] = vehicle_queue[vehicle_index + 1];
+            }
+            /**
+             * Mettre à jour le nombre de véhicules dans la file d'attente
+             */
+            --num_vehicles;
+            sem_post(&vehicle_lock);
+        }
+        sleep(1);
+    }
+}
