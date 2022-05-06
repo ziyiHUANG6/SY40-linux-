@@ -1,0 +1,156 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<stdbool.h>
+#include<unistd.h>
+#include<string.h>
+#include<pthread.h>
+#include<semaphore.h>
+#include<sys/time.h>
+
+int CUT_TIME;
+int VISIT_TIME;
+int LEAVE_TIME;
+
+int SNUM;        //Seat
+int BNUM;        //Barber
+int CNUM;        //Customer
+
+sem_t cus;
+sem_t bar;
+sem_t mutex;
+sem_t mutex2;
+sem_t worker;
+
+int i,j,k;
+int working = 0;
+int waiting = 0;
+int leave = 0;
+int count = 0;
+int served[20] = {0};
+void *barber(void *arg)
+{
+    while(1){
+    	struct timeval tv;
+    	gettimeofday(&tv, NULL);
+    	srand(tv.tv_sec + tv.tv_usec + getpid());
+    	CUT_TIME = rand()%10001;
+
+    	sem_wait(&worker);
+    	sem_wait(&mutex);
+    	if(waiting == 0)
+    	{
+    		printf("********no client,n %ld barber is sleeping!*********\n",(unsigned long )arg);
+    		working--;
+    		sem_post(&mutex);
+    		sem_post(&worker);
+    		sem_wait(&cus); 
+    	}
+    	else
+    	{
+
+    		sem_post(&bar);
+    		waiting--;
+    		printf("n %ld barber start working,served people:%d\n",(unsigned long )arg,served[(unsigned long )arg]);
+    		//printf("%d\n",CUT_TIME);
+    		printf("the number of wait: %d\n",waiting);
+    		sem_post(&mutex); 
+    		usleep(CUT_TIME);
+    		printf("work finis!\n");
+    		count++;
+    		served[(unsigned long )arg]++;
+    		sem_post(&worker); 
+     }
+  }
+}
+
+void *customer(void *arg) 
+{
+	struct timeval tv;
+    gettimeofday(&tv, NULL);
+    srand(tv.tv_sec + tv.tv_usec + getpid());
+	LEAVE_TIME = rand()%11;
+ 	sem_wait(&mutex2); 
+    printf("%ld client entre...\n",(unsigned long )arg);
+
+    if(waiting == SNUM) 
+    {
+    	leave++;
+    	sem_post(&mutex2);
+    	printf("n %ld client leave!number of leave:%d\n",(unsigned long )arg,leave);
+    }
+    else
+    {
+    	waiting++;
+    	printf("n %ld client sit,the number of wait:%d\n",(unsigned long )arg,waiting);
+    	if(waiting == 1 && working < 0)  
+    	{
+        	printf("barber is going to work\n");
+        	working++;
+        	sem_post(&cus);
+        }
+        sem_post(&mutex2);
+        sem_wait(&bar);
+    }
+
+    usleep(LEAVE_TIME);
+}
+
+void main()
+{
+	int temp;
+
+	printf("enter the num of chairs:");
+    scanf("%d",&SNUM);
+	printf("enter the number of barbers:");
+    scanf("%d",&BNUM);
+    printf("enter the number of clients:");
+    scanf("%d",&CNUM);
+
+	int res;
+    pthread_t barber_thread[BNUM],customer_thread[CNUM];
+
+	sem_init(&bar,0,0);
+	sem_init(&cus,0,0);
+	sem_init(&worker,0,BNUM);
+	sem_init(&mutex,0,1);
+	sem_init(&mutex2,0,1);
+
+	struct timeval tv;
+    gettimeofday(&tv, NULL);
+    srand(tv.tv_sec + tv.tv_usec + getpid());
+	VISIT_TIME = rand()%11;
+
+    for(i=1;i<=BNUM;i++)
+    {
+       res=pthread_create(&barber_thread[i],NULL,barber,(void*)(unsigned long)(i));
+       usleep(10000);
+       if (res!=0)
+          perror("Thread creation failure!\n");
+    }
+
+    for(i=1;i<=CNUM;i++)
+    {
+    	struct timeval tv;
+    	gettimeofday(&tv, NULL);
+    	srand(tv.tv_sec + tv.tv_usec + getpid());
+    	VISIT_TIME = rand()%11;
+       usleep(VISIT_TIME);
+       res=pthread_create(&customer_thread[i],NULL,customer,(void*)(unsigned long)(i));
+       if (res!=0)
+           perror("Thread creation failure!\n");
+    }
+    for(i=1;i<=CNUM;i++)
+    {
+        pthread_join(customer_thread[i],NULL);
+	}
+    usleep(10000);
+    for(j=1;j<=BNUM;j++){
+    	for(k=1;k<=BNUM-j;k++){
+    		if(served[k]<served[k+1]){
+    			temp = served[k];
+    			served[k]=served[k+1];
+    			served[k+1]=temp;
+    		}
+    	}
+    }
+}
